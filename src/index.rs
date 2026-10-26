@@ -23,11 +23,10 @@ struct Candidate {
     similarity: f32,
 }
 
-// BinaryHeap is a max-heap. Reverse score ordering so the worst
-// candidate is at the root and can be replaced efficiently.
 impl PartialEq for Candidate {
     fn eq(&self, other: &Self) -> bool {
-        self.similarity.total_cmp(&other.similarity) == Ordering::Equal && self.id == other.id
+        self.similarity.total_cmp(&other.similarity) == Ordering::Equal
+            && self.id == other.id
     }
 }
 
@@ -50,9 +49,11 @@ impl Ord for Candidate {
 
 impl Candidate {
     fn is_better_than(&self, other: &Self) -> bool {
-        self.similarity.total_cmp(&other.similarity) == Ordering::Greater
-            || (self.similarity.total_cmp(&other.similarity) == Ordering::Equal
-                && self.id < other.id)
+        match self.similarity.total_cmp(&other.similarity) {
+            Ordering::Greater => true,
+            Ordering::Equal => self.id < other.id,
+            Ordering::Less => false,
+        }
     }
 }
 
@@ -69,6 +70,10 @@ impl VectorIndex {
         })
     }
 
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
     pub fn len(&self) -> usize {
         self.vectors.len()
     }
@@ -77,7 +82,17 @@ impl VectorIndex {
         self.vectors.is_empty()
     }
 
-    pub fn insert(&mut self, id: VectorId, data: Vec<f32>) -> Result<(), SearchError> {
+    pub fn get(&self, id: VectorId) -> Option<&Embedding> {
+        self.id_to_slot
+            .get(&id)
+            .map(|&slot| &self.vectors[slot])
+    }
+
+    pub fn insert(
+        &mut self,
+        id: VectorId,
+        data: Vec<f32>,
+    ) -> Result<(), SearchError> {
         if data.len() != self.dimension {
             return Err(SearchError::DimensionMismatch {
                 expected: self.dimension,
@@ -98,9 +113,14 @@ impl VectorIndex {
         Ok(())
     }
 
-    pub fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<SearchResult>, SearchError> {
+    pub fn search(
+        &self,
+        query: &[f32],
+        top_k: usize,
+    ) -> Result<Vec<SearchResult>, SearchError> {
         let query_norm = self.prepare_query(query, top_k)?;
-        if top_k == 0 || self.vectors.is_empty() {
+
+        if top_k == 0 || self.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -108,7 +128,7 @@ impl VectorIndex {
             &self.vectors,
             query,
             query_norm,
-            top_k.min(self.vectors.len()),
+            top_k.min(self.len()),
         );
 
         Ok(finish_candidates(candidates))
@@ -125,28 +145,34 @@ impl VectorIndex {
         }
 
         let query_norm = self.prepare_query(query, top_k)?;
-        if top_k == 0 || self.vectors.is_empty() {
+
+        if top_k == 0 || self.is_empty() {
             return Ok(Vec::new());
         }
 
-        let k = top_k.min(self.vectors.len());
-        let chunk_size = self.vectors.len().div_ceil(worker_count);
+        let k = top_k.min(self.len());
+        let chunk_size = self.len().div_ceil(worker_count);
 
-        // Scoped threads borrow the index and query; no full-index clone or Arc.
-        let partials: Result<Vec<Vec<Candidate>>, SearchError> = thread::scope(|scope| {
-            let mut handles = Vec::new();
+        let partials: Result<Vec<Vec<Candidate>>, SearchError> =
+            thread::scope(|scope| {
+                let mut handles = Vec::new();
 
-            for chunk in self.vectors.chunks(chunk_size) {
-                handles.push(scope.spawn(move || top_k_candidates(chunk, query, query_norm, k)));
-            }
+                for chunk in self.vectors.chunks(chunk_size) {
+                    handles.push(scope.spawn(move || {
+                        top_k_candidates(chunk, query, query_norm, k)
+                    }));
+                }
 
-            handles
-                .into_iter()
-                .map(|handle| handle.join().map_err(|_| SearchError::WorkerPanicked))
-                .collect()
-        });
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().map_err(|_| SearchError::WorkerPanicked)
+                    })
+                    .collect()
+            });
 
         let mut merged = BinaryHeap::with_capacity(k);
+
         for candidates in partials? {
             for candidate in candidates {
                 push_bounded(&mut merged, candidate, k);
@@ -156,16 +182,16 @@ impl VectorIndex {
         Ok(finish_candidates(merged.into_vec()))
     }
 
-    fn prepare_query(&self, query: &[f32], top_k: usize) -> Result<f64, SearchError> {
+    fn prepare_query(
+        &self,
+        query: &[f32],
+        top_k: usize,
+    ) -> Result<f64, SearchError> {
         if query.len() != self.dimension {
             return Err(SearchError::DimensionMismatch {
                 expected: self.dimension,
                 actual: query.len(),
             });
-        }
-
-        if top_k == 0 || self.vectors.is_empty() {
-            return Ok(0.0);
         }
 
         let mut squared_norm = 0.0_f64;
@@ -177,6 +203,12 @@ impl VectorIndex {
 
             let value = f64::from(value);
             squared_norm += value * value;
+        }
+
+        // No search is needed, but dimensions and finite values
+        // have still been validated.
+        if top_k == 0 || self.is_empty() {
+            return Ok(0.0);
         }
 
         if squared_norm == 0.0 {
@@ -207,7 +239,11 @@ fn top_k_candidates(
     heap.into_vec()
 }
 
-fn push_bounded(heap: &mut BinaryHeap<Candidate>, candidate: Candidate, k: usize) {
+fn push_bounded(
+    heap: &mut BinaryHeap<Candidate>,
+    candidate: Candidate,
+    k: usize,
+) {
     if heap.len() < k {
         heap.push(candidate);
         return;

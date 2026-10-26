@@ -8,6 +8,7 @@ edition = "2024"
 
 [dev-dependencies]
 criterion = "0.5"
+instant-distance = "0.6.1"
 
 [[bench]]
 name = "search"

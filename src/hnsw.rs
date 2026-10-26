@@ -1,5 +1,7 @@
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::time::Instant;
 
 use crate::error::SearchError;
 use crate::index::SearchResult;
@@ -7,18 +9,191 @@ use crate::vector::{Embedding, VectorId};
 
 const MAX_LEVEL: usize = 16;
 
+// -----------------------------------------------------------------------------
+// Profiling
+// -----------------------------------------------------------------------------
+
+static SEARCH_LAYER_NS: AtomicU64 = AtomicU64::new(0);
+static SELECT_NEIGHBORS_NS: AtomicU64 = AtomicU64::new(0);
+static PRUNE_NEIGHBORS_NS: AtomicU64 = AtomicU64::new(0);
+
+static SEARCH_LAYER_CALLS: AtomicU64 = AtomicU64::new(0);
+static SELECT_NEIGHBORS_CALLS: AtomicU64 = AtomicU64::new(0);
+static PRUNE_NEIGHBORS_CALLS: AtomicU64 = AtomicU64::new(0);
+
+struct ProfileTimer {
+    nanos: &'static AtomicU64,
+    calls: &'static AtomicU64,
+    start: Instant,
+}
+
+impl ProfileTimer {
+    #[inline]
+    fn new(
+        nanos: &'static AtomicU64,
+        calls: &'static AtomicU64,
+    ) -> Self {
+        Self {
+            nanos,
+            calls,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ProfileTimer {
+    #[inline]
+    fn drop(&mut self) {
+        let elapsed_ns = self.start.elapsed().as_nanos() as u64;
+
+        self.nanos
+            .fetch_add(elapsed_ns, AtomicOrdering::Relaxed);
+
+        self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
+fn reset_profile() {
+    SEARCH_LAYER_NS.store(0, AtomicOrdering::Relaxed);
+    SELECT_NEIGHBORS_NS.store(0, AtomicOrdering::Relaxed);
+    PRUNE_NEIGHBORS_NS.store(0, AtomicOrdering::Relaxed);
+
+    SEARCH_LAYER_CALLS.store(0, AtomicOrdering::Relaxed);
+    SELECT_NEIGHBORS_CALLS.store(0, AtomicOrdering::Relaxed);
+    PRUNE_NEIGHBORS_CALLS.store(0, AtomicOrdering::Relaxed);
+}
+
+fn print_profile(
+    name: &str,
+    nanos: &AtomicU64,
+    calls: &AtomicU64,
+) {
+    let total_ms =
+        nanos.load(AtomicOrdering::Relaxed) as f64 / 1_000_000.0;
+    let count = calls.load(AtomicOrdering::Relaxed);
+
+    let avg_us = if count == 0 {
+        0.0
+    } else {
+        total_ms * 1000.0 / count as f64
+    };
+
+    println!(
+        "{name:<20} calls={count:>8} total={total_ms:>10.2} ms avg={avg_us:>10.2} us"
+    );
+}
+
+fn print_profile_report() {
+    println!();
+    println!("HNSW build profiling:");
+    println!(
+        "{:<20} {:>14} {:>14} {:>14}",
+        "Function", "Calls", "Total (ms)", "Average (us)"
+    );
+    println!("{}", "-".repeat(66));
+
+    print_profile(
+        "search_layer",
+        &SEARCH_LAYER_NS,
+        &SEARCH_LAYER_CALLS,
+    );
+
+    print_profile(
+        "select_neighbors",
+        &SELECT_NEIGHBORS_NS,
+        &SELECT_NEIGHBORS_CALLS,
+    );
+
+    print_profile(
+        "prune_neighbors",
+        &PRUNE_NEIGHBORS_NS,
+        &PRUNE_NEIGHBORS_CALLS,
+    );
+}
+
+// -----------------------------------------------------------------------------
+// HNSW candidates
+// -----------------------------------------------------------------------------
+
+
+#[derive(Default)]
+struct PruneWorkspace {
+    candidates: Vec<Candidate>,
+    selected: Vec<usize>,
+    selected_marks: Vec<u32>,
+    generation: u32,
+}
+
+impl PruneWorkspace {
+    #[inline]
+    fn prepare(&mut self, candidate_capacity: usize, limit: usize) {
+        self.candidates.clear();
+        self.selected.clear();
+
+        if self.candidates.capacity() < candidate_capacity {
+            self.candidates.reserve(candidate_capacity);
+        }
+
+        if self.selected.capacity() < limit {
+            self.selected.reserve(limit);
+        }
+    }
+}
+
+#[derive(Default)]
+struct SearchWorkspace {
+    visited_marks: Vec<u32>,
+    generation: u32,
+}
+
+impl SearchWorkspace {
+    #[inline]
+    fn begin(&mut self, len: usize) -> u32 {
+        if self.visited_marks.len() < len {
+            self.visited_marks.resize(len, 0);
+        }
+
+        self.generation = self.generation.wrapping_add(1);
+
+        if self.generation == 0 {
+            self.visited_marks.fill(0);
+            self.generation = 1;
+        }
+
+        self.generation
+    }
+
+    #[inline]
+    fn visit(&mut self, slot: usize, generation: u32) -> bool {
+        if self.visited_marks[slot] == generation {
+            false
+        } else {
+            self.visited_marks[slot] = generation;
+            true
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Candidate {
     slot: usize,
     id: VectorId,
-    score: f32,
+    similarity: f32,
 }
 
-// Max-heap: highest similarity first; lower ID wins ties.
+impl Candidate {
+    #[inline]
+    fn is_better_than(&self, other: &Self) -> bool {
+        self.similarity.total_cmp(&other.similarity) == Ordering::Greater
+            || (self.similarity.total_cmp(&other.similarity) == Ordering::Equal
+                && self.id < other.id)
+    }
+}
+
 impl PartialEq for Candidate {
     fn eq(&self, other: &Self) -> bool {
-        self.score.total_cmp(&other.score) == Ordering::Equal
-            && self.id == other.id
+        self.slot == other.slot
+            && self.similarity.to_bits() == other.similarity.to_bits()
     }
 }
 
@@ -32,19 +207,16 @@ impl PartialOrd for Candidate {
 
 impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.score
-            .total_cmp(&other.score)
-            .then_with(|| other.id.0.cmp(&self.id.0))
+        self.similarity
+            .total_cmp(&other.similarity)
+            .then_with(|| other.id.cmp(&self.id))
+            .then_with(|| self.slot.cmp(&other.slot))
     }
 }
 
-impl Candidate {
-    fn better_than(&self, other: &Self) -> bool {
-        self.score.total_cmp(&other.score) == Ordering::Greater
-            || (self.score.total_cmp(&other.score) == Ordering::Equal
-                && self.id < other.id)
-    }
-}
+// -----------------------------------------------------------------------------
+// HNSW index
+// -----------------------------------------------------------------------------
 
 pub struct HnswIndex {
     dimension: usize,
@@ -54,7 +226,6 @@ pub struct HnswIndex {
     vectors: Vec<Embedding>,
     id_to_slot: HashMap<VectorId, usize>,
     levels: Vec<usize>,
-    // graph[node][layer] stores neighboring vector slots.
     graph: Vec<Vec<Vec<usize>>>,
     entry_point: Option<usize>,
     max_level: usize,
@@ -67,11 +238,7 @@ impl HnswIndex {
         ef_construction: usize,
         ef_search: usize,
     ) -> Result<Self, SearchError> {
-        if dimension == 0 {
-            return Err(SearchError::EmptyVector);
-        }
-
-        if m < 2 || ef_construction < m || ef_search == 0 {
+        if dimension == 0 || m < 2 || ef_construction < m || ef_search == 0 {
             return Err(SearchError::InvalidHnswConfig);
         }
 
@@ -113,9 +280,8 @@ impl HnswIndex {
             return Err(SearchError::DuplicateId(id.0));
         }
 
-        // Validate the embedding before mutating the index.
         let embedding = Embedding::new(id, data)?;
-        let level = Self::random_level(id, self.m);
+        let level = random_level(id, self.m);
         let slot = self.vectors.len();
 
         self.vectors.push(embedding);
@@ -123,52 +289,50 @@ impl HnswIndex {
         self.graph.push(vec![Vec::new(); level + 1]);
         self.id_to_slot.insert(id, slot);
 
-        let Some(mut current) = self.entry_point else {
+        let Some(mut entry) = self.entry_point else {
             self.entry_point = Some(slot);
             self.max_level = level;
             return Ok(());
         };
 
-        let query = self.vectors[slot].data.clone();
-        let query_norm = self.vectors[slot].norm;
+        // Own a copy so subsequent graph mutations do not conflict
+        // with a borrow into self.vectors.
+        let query = self.vectors[slot].clone();
         let old_max_level = self.max_level;
 
-        // Greedily descend through layers the new node cannot join.
-        if level < old_max_level {
-            for layer in ((level + 1)..=old_max_level).rev() {
-                current = self.greedy_search(&query, query_norm, current, layer);
-            }
+        for layer in ((level + 1)..=old_max_level).rev() {
+            entry = self.greedy_search(&query, entry, layer);
         }
 
-        // Search from upper to lower layers.
+        let mut prune_workspace = PruneWorkspace::default();
+        let mut search_workspace = SearchWorkspace::default();
+
         for layer in (0..=level.min(old_max_level)).rev() {
             let candidates = self.search_layer(
                 &query,
-                query_norm,
-                &[current],
+                &[entry],
                 self.ef_construction,
                 layer,
+                &mut search_workspace,
             );
+            
+            let next_entry = candidates.first().map(|candidate| candidate.slot);
 
-            let limit = self.max_neighbors(layer);
             let neighbors =
-                self.select_neighbors(slot, candidates, limit);
-
-            // Establish reciprocal links before pruning the existing nodes.
-            self.graph[slot][layer] = neighbors.clone();
+                self.select_neighbors(slot, candidates, self.m_for_layer(layer));
 
             for &neighbor in &neighbors {
-                self.add_directed_edge(neighbor, slot, layer);
+                self.graph[slot][layer].push(neighbor);
+                self.graph[neighbor][layer].push(slot);
             }
 
-            for neighbor in neighbors {
-                if self.graph[neighbor][layer].len() > self.max_neighbors(layer) {
-                    self.prune_neighbors(neighbor, layer);
-                }
+            // Reuse the same scratch buffers for every prune call.
+            for &neighbor in &neighbors {
+                self.prune_neighbors(neighbor, layer, &mut prune_workspace);
             }
 
-            if let Some(&nearest) = self.graph[slot][layer].first() {
-                current = nearest;
+            if let Some(closest) = next_entry {
+                entry = closest;
             }
         }
 
@@ -194,39 +358,6 @@ impl HnswIndex {
         top_k: usize,
         ef: usize,
     ) -> Result<Vec<SearchResult>, SearchError> {
-        self.validate_query(query)?;
-
-        if top_k == 0 || self.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let query_norm = norm(query);
-        let mut current = self.entry_point.expect("non-empty index has entry");
-
-        // Greedy descent through the upper layers.
-        for layer in (1..=self.max_level).rev() {
-            current = self.greedy_search(query, query_norm, current, layer);
-        }
-
-        let candidates = self.search_layer(
-            query,
-            query_norm,
-            &[current],
-            ef.max(top_k).max(1),
-            0,
-        );
-
-        Ok(candidates
-            .into_iter()
-            .take(top_k)
-            .map(|candidate| SearchResult {
-                id: candidate.id,
-                similarity: candidate.score,
-            })
-            .collect())
-    }
-
-    fn validate_query(&self, query: &[f32]) -> Result<(), SearchError> {
         if query.len() != self.dimension {
             return Err(SearchError::DimensionMismatch {
                 expected: self.dimension,
@@ -234,22 +365,41 @@ impl HnswIndex {
             });
         }
 
-        if query.iter().any(|value| !value.is_finite()) {
-            return Err(SearchError::NonFiniteValue);
+        if top_k == 0 || self.vectors.is_empty() {
+            return Ok(Vec::new());
         }
 
-        if norm(query) == 0.0 {
-            return Err(SearchError::ZeroNorm);
+        let query = Embedding::new(VectorId(u64::MAX), query.to_vec())?;
+
+        let Some(mut entry) = self.entry_point else {
+            return Ok(Vec::new());
+        };
+
+        for layer in (1..=self.max_level).rev() {
+            entry = self.greedy_search(&query, entry, layer);
         }
 
-        Ok(())
+        let mut workspace = SearchWorkspace::default();
+
+        let candidates = self.search_layer(
+            &query,
+            &[entry],
+            ef.max(top_k).max(1),
+            0,
+            &mut workspace,
+        );
+
+        Ok(candidates
+            .into_iter()
+            .take(top_k)
+            .map(|candidate| SearchResult {
+                id: candidate.id,
+                similarity: candidate.similarity,
+            })
+            .collect())
     }
 
-    fn score(&self, slot: usize, query: &[f32], query_norm: f64) -> f32 {
-        self.vectors[slot].cosine_similarity(query, query_norm)
-    }
-
-    fn max_neighbors(&self, layer: usize) -> usize {
+    fn m_for_layer(&self, layer: usize) -> usize {
         if layer == 0 {
             self.m.saturating_mul(2)
         } else {
@@ -257,253 +407,424 @@ impl HnswIndex {
         }
     }
 
-    fn greedy_search(
-        &self,
-        query: &[f32],
-        query_norm: f64,
-        start: usize,
-        layer: usize,
-    ) -> usize {
-        let mut current = start;
-        let mut current_score = Candidate {
-            slot: current,
-            id: self.vectors[current].id,
-            score: self.score(current, query, query_norm),
-        };
+    #[inline]
+    fn score(&self, query: &Embedding, slot: usize) -> f32 {
+        query.normalized_dot(&self.vectors[slot])
+    }
 
-        loop {
-            let mut best = current_score;
+    #[inline]
+    fn candidate(&self, query: &Embedding, slot: usize) -> Candidate {
+        let embedding = &self.vectors[slot];
 
-            for &neighbor in &self.graph[current][layer] {
-                let candidate = Candidate {
-                    slot: neighbor,
-                    id: self.vectors[neighbor].id,
-                    score: self.score(neighbor, query, query_norm),
-                };
-
-                if candidate.better_than(&best) {
-                    best = candidate;
-                }
-            }
-
-            if best.slot == current {
-                return current;
-            }
-
-            current = best.slot;
-            current_score = best;
+        Candidate {
+            slot,
+            id: embedding.id,
+            similarity: self.score(query, slot),
         }
     }
 
-    // Best-first graph traversal with a bounded result set.
+    fn greedy_search(
+        &self,
+        query: &Embedding,
+        mut current: usize,
+        layer: usize,
+    ) -> usize {
+        let mut current_score = self.score(query, current);
+
+        loop {
+            let mut best = current;
+            let mut best_score = current_score;
+
+            if layer < self.graph[current].len() {
+                for &neighbor in &self.graph[current][layer] {
+                    let score = self.score(query, neighbor);
+
+                    if score.total_cmp(&best_score) == Ordering::Greater
+                        || (score.total_cmp(&best_score) == Ordering::Equal
+                            && self.vectors[neighbor].id
+                                < self.vectors[best].id)
+                    {
+                        best = neighbor;
+                        best_score = score;
+                    }
+                }
+            }
+
+            if best == current {
+                break;
+            }
+
+            current = best;
+            current_score = best_score;
+        }
+
+        current
+    }
+
+    
     fn search_layer(
         &self,
-        query: &[f32],
-        query_norm: f64,
+        query: &Embedding,
         entries: &[usize],
         ef: usize,
         layer: usize,
+        workspace: &mut SearchWorkspace,
     ) -> Vec<Candidate> {
-        if ef == 0 {
-            return Vec::new();
-        }
+        let _profile = ProfileTimer::new(
+            &SEARCH_LAYER_NS,
+            &SEARCH_LAYER_CALLS,
+        );
 
-        // Best candidate to explore is popped first.
+        let ef = ef.max(1);
+        let generation = workspace.begin(self.vectors.len());
+
         let mut exploration = BinaryHeap::<Candidate>::new();
-
-        // Reverse makes the worst retained candidate the heap maximum.
         let mut results = BinaryHeap::<Reverse<Candidate>>::new();
-        let mut visited = HashSet::new();
 
         for &slot in entries {
-            if !visited.insert(slot) {
+            if !workspace.visit(slot, generation) {
                 continue;
             }
 
-            let candidate = Candidate {
-                slot,
-                id: self.vectors[slot].id,
-                score: self.score(slot, query, query_norm),
-            };
-
+            let candidate = self.candidate(query, slot);
             exploration.push(candidate);
             results.push(Reverse(candidate));
         }
 
-        while let Some(candidate) = exploration.pop() {
-            if results.len() >= ef {
-                let worst = results
-                    .peek()
-                    .expect("results is non-empty")
-                    .0;
+        while let Some(current) = exploration.pop() {
+            let Some(Reverse(worst)) = results.peek().copied() else {
+                break;
+            };
 
-                // All remaining exploration candidates are no better.
-                if !candidate.better_than(&worst) {
-                    break;
-                }
+            if results.len() >= ef && !current.is_better_than(&worst) {
+                break;
             }
 
-            for &neighbor in &self.graph[candidate.slot][layer] {
-                if !visited.insert(neighbor) {
+            if layer >= self.graph[current.slot].len() {
+                continue;
+            }
+
+            for &neighbor in &self.graph[current.slot][layer] {
+                if !workspace.visit(neighbor, generation) {
                     continue;
                 }
 
-                let next = Candidate {
-                    slot: neighbor,
-                    id: self.vectors[neighbor].id,
-                    score: self.score(neighbor, query, query_norm),
-                };
+                let candidate = self.candidate(query, neighbor);
 
                 let should_add = results.len() < ef
-                    || next.better_than(
-                        &results.peek().expect("results is non-empty").0,
-                    );
+                    || results
+                        .peek()
+                        .is_some_and(|Reverse(worst)| {
+                            candidate.is_better_than(worst)
+                        });
 
-                if should_add {
-                    exploration.push(next);
-                    results.push(Reverse(next));
+                if !should_add {
+                    continue;
+                }
 
-                    if results.len() > ef {
-                        results.pop();
-                    }
+                exploration.push(candidate);
+                results.push(Reverse(candidate));
+
+                if results.len() > ef {
+                    results.pop();
                 }
             }
         }
 
-        let mut output: Vec<Candidate> = results
-            .into_iter()
-            .map(|Reverse(candidate)| candidate)
-            .collect();
+        let mut output: Vec<Candidate> =
+            results.into_iter().map(|Reverse(c)| c).collect();
 
         output.sort_unstable_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
+            b.similarity
+                .total_cmp(&a.similarity)
                 .then_with(|| a.id.cmp(&b.id))
         });
 
         output
     }
 
-    // Select neighbors using the HNSW diversity heuristic.
+
     fn select_neighbors(
         &self,
         center: usize,
-        mut candidates: Vec<Candidate>,
+        candidates: Vec<Candidate>,
         limit: usize,
     ) -> Vec<usize> {
-        candidates.sort_unstable_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        let _profile = ProfileTimer::new(
+            &SELECT_NEIGHBORS_NS,
+            &SELECT_NEIGHBORS_CALLS,
+        );
 
-        // Remove duplicate slots while preserving candidate ranking.
-        let mut seen = HashSet::with_capacity(candidates.len());
-        candidates.retain(|candidate| seen.insert(candidate.slot));
+        if limit == 0 {
+            return Vec::new();
+        }
 
-        let center_data = &self.vectors[center].data;
-        let center_norm = self.vectors[center].norm;
+        let mut selected = Vec::<usize>::with_capacity(limit);
 
-        let mut selected: Vec<Candidate> = Vec::with_capacity(limit);
-        let mut deferred: Vec<Candidate> = Vec::new();
+        for candidate in &candidates {
+            let slot = candidate.slot;
 
-        for candidate in candidates {
-            if candidate.slot == center {
+            if slot == center {
                 continue;
             }
 
-            if selected.len() >= limit {
-                break;
-            }
+            let diverse = selected.iter().all(|&chosen| {
+                let similarity = self.vectors[slot]
+                    .normalized_dot(&self.vectors[chosen]);
 
-            let center_similarity =
-                self.score(candidate.slot, center_data, center_norm);
-
-            let diverse = selected.iter().all(|chosen| {
-                let between_similarity = self.vectors[candidate.slot]
-                    .cosine_similarity(
-                        &self.vectors[chosen.slot].data,
-                        self.vectors[chosen.slot].norm,
-                    );
-
-                // Cosine-distance form:
-                // d(candidate, chosen) > d(candidate, center)
-                // is equivalent to between_similarity < center_similarity.
-                between_similarity < center_similarity
+                similarity < candidate.similarity
             });
 
             if diverse {
-                selected.push(candidate);
-            } else {
-                deferred.push(candidate);
+                selected.push(slot);
+
+                if selected.len() == limit {
+                    return selected;
+                }
             }
         }
 
-        // Fill remaining capacity with the closest deferred candidates.
-        for candidate in deferred {
-            if selected.len() >= limit {
-                break;
-            }
+        // Fill remaining slots with the best candidates rejected by
+        // the diversity heuristic.
+        for candidate in &candidates {
+            let slot = candidate.slot;
 
-            selected.push(candidate);
+            if slot != center && !selected.contains(&slot) {
+                selected.push(slot);
+
+                if selected.len() == limit {
+                    break;
+                }
+            }
         }
 
         selected
-            .into_iter()
-            .map(|candidate| candidate.slot)
-            .collect()
     }
 
-    fn add_directed_edge(&mut self, from: usize, to: usize, layer: usize) {
-        if from == to || self.graph[from][layer].contains(&to) {
+    
+    fn prune_neighbors(
+        &mut self,
+        center: usize,
+        layer: usize,
+        workspace: &mut PruneWorkspace,
+    ) {
+        if layer >= self.graph[center].len() {
             return;
         }
 
-        self.graph[from][layer].push(to);
-    }
+        let limit = self.m_for_layer(layer);
+        if self.graph[center][layer].len() <= limit {
+            return;
+        }
 
-    fn prune_neighbors(&mut self, center: usize, layer: usize) {
-        let candidates: Vec<Candidate> = self.graph[center][layer]
-            .iter()
-            .copied()
-            .map(|slot| Candidate {
+        // Time only calls that actually prune an overflowing list.
+        let _profile = ProfileTimer::new(
+            &PRUNE_NEIGHBORS_NS,
+            &PRUNE_NEIGHBORS_CALLS,
+        );
+
+        let candidate_count = self.graph[center][layer].len();
+        workspace.prepare(candidate_count, limit);
+
+        if workspace.selected_marks.len() < self.vectors.len() {
+            workspace.selected_marks.resize(self.vectors.len(), 0);
+        }
+
+        workspace.generation = workspace.generation.wrapping_add(1);
+
+        if workspace.generation == 0 {
+            workspace.selected_marks.fill(0);
+            workspace.generation = 1;
+        }
+
+        let generation = workspace.generation;
+
+        let center_embedding = &self.vectors[center];
+
+        for &slot in &self.graph[center][layer] {
+            workspace.candidates.push(Candidate {
                 slot,
                 id: self.vectors[slot].id,
-                score: self.vectors[center].cosine_similarity(
-                    &self.vectors[slot].data,
-                    self.vectors[slot].norm,
-                ),
-            })
-            .collect();
+                similarity: center_embedding.normalized_dot(&self.vectors[slot]),
+            });
+        }
 
-        let selected =
-            self.select_neighbors(center, candidates, self.max_neighbors(layer));
+        if workspace.candidates.len() > 1 {
+            workspace.candidates.sort_unstable_by(|a, b| {
+                b.similarity
+                    .total_cmp(&a.similarity)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+        }
 
-        self.graph[center][layer] = selected;
+        // Diversity-first pass.
+        for candidate in &workspace.candidates {
+            let slot = candidate.slot;
+
+            if slot == center {
+                continue;
+            }
+
+            let diverse = workspace.selected.iter().all(|&chosen| {
+                self.vectors[slot].normalized_dot(&self.vectors[chosen])
+                    < candidate.similarity
+            });
+
+            if diverse {
+                workspace.selected.push(slot);
+                workspace.selected_marks[slot] = generation;
+
+                if workspace.selected.len() == limit {
+                    self.graph[center][layer].clone_from(&workspace.selected);
+                    return;
+                }
+            }
+        }
+
+        // Fill remaining slots in similarity order.
+        for candidate in &workspace.candidates {
+            let slot = candidate.slot;
+
+            if slot == center || workspace.selected_marks[slot] == generation {
+                continue;
+            }
+
+            workspace.selected.push(slot);
+
+            if workspace.selected.len() == limit {
+                break;
+            }
+        }
+
+        self.graph[center][layer].clone_from(&workspace.selected);
     }
 
-    // Deterministic logarithmic level distribution:
-    // P(level >= k) is approximately 1 / M^k.
-    fn random_level(id: VectorId, m: usize) -> usize {
-        let mut x = id.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+}
+
+fn random_level(id: VectorId, m: usize) -> usize {
+    let mut x = id.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+
+    let u = ((x >> 11) as f64 + 1.0)
+        / ((1u64 << 53) as f64 + 1.0);
+
+    ((-u.ln() / (m as f64).ln()).floor() as usize).min(MAX_LEVEL)
+}
+
+// -----------------------------------------------------------------------------
+// Manual benchmark
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod benchmark {
+    use super::*;
+    use crate::index::VectorIndex;
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    const DIM: usize = 128;
+    const N: usize = 10_000;
+    const QUERY_COUNT: usize = 100;
+    const K: usize = 10;
+
+    fn sample(mut x: u64) -> f32 {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
         x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         x ^= x >> 31;
 
-        let mantissa = x >> 11;
-        let u = (mantissa as f64 + 1.0) / ((1u64 << 53) as f64);
-
-        ((-u.ln() / (m as f64).ln()).floor() as usize).min(MAX_LEVEL)
+        let unit = (x >> 40) as f32 / (1u32 << 24) as f32;
+        unit * 2.0 - 1.0
     }
-}
 
-fn norm(vector: &[f32]) -> f64 {
-    vector
-        .iter()
-        .map(|&value| {
-            let value = f64::from(value);
-            value * value
-        })
-        .sum::<f64>()
-        .sqrt()
+    fn vector(id: u64) -> Vec<f32> {
+        (0..DIM)
+            .map(|j| sample(id.wrapping_mul(DIM as u64).wrapping_add(j as u64)))
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "manual benchmark; run with --ignored --nocapture"]
+    fn benchmark_hnsw() {
+        let mut exact = VectorIndex::new(DIM).unwrap();
+        let mut hnsw = HnswIndex::new(DIM, 16, 200, 64).unwrap();
+
+        let start = Instant::now();
+
+        for i in 0..N {
+            exact.insert(VectorId(i as u64), vector(i as u64)).unwrap();
+        }
+
+        let exact_build = start.elapsed();
+
+        // Reset immediately before the HNSW build so only construction is measured.
+        reset_profile();
+
+        let start = Instant::now();
+
+        for i in 0..N {
+            hnsw.insert(VectorId(i as u64), vector(i as u64)).unwrap();
+        }
+
+        let hnsw_build = start.elapsed();
+
+        println!("Vectors: {N}, dimensions: {DIM}, queries: {QUERY_COUNT}, k: {K}");
+        println!("Exact build: {:?}", exact_build);
+        println!("HNSW build:  {:?}", hnsw_build);
+
+        // Print before search benchmarks so query-time calls do not affect these counters.
+        print_profile_report();
+
+        let queries: Vec<Vec<f32>> = (0..QUERY_COUNT)
+            .map(|i| vector(50_000_000 + i as u64))
+            .collect();
+
+        // Compute exact ground truth once per query.
+        let ground_truth: Vec<HashSet<VectorId>> = queries
+            .iter()
+            .map(|q| {
+                exact
+                    .search(q, K)
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.id)
+                    .collect()
+            })
+            .collect();
+
+        println!();
+        println!(
+            "{:>8} {:>12} {:>12} {:>12}",
+            "ef", "recall@10", "avg us", "p95 us"
+        );
+
+        for ef in [16, 32, 64, 128, 200, 256] {
+            let mut hits = 0usize;
+            let mut latencies = Vec::with_capacity(QUERY_COUNT);
+
+            for (i, query) in queries.iter().enumerate() {
+                let start = Instant::now();
+                let results = hnsw.search_with_ef(query, K, ef).unwrap();
+                latencies.push(start.elapsed().as_secs_f64() * 1_000_000.0);
+
+                hits += results
+                    .iter()
+                    .filter(|r| ground_truth[i].contains(&r.id))
+                    .count();
+            }
+
+            latencies.sort_by(f64::total_cmp);
+
+            let recall = hits as f64 / (QUERY_COUNT * K) as f64 * 100.0;
+            let avg_us = latencies.iter().sum::<f64>() / latencies.len() as f64;
+            let p95_us = latencies[((latencies.len() * 95).div_ceil(100) - 1)
+                .min(latencies.len() - 1)];
+
+            println!(
+                "{ef:>8} {recall:>11.2}% {avg_us:>11.2} {p95_us:>11.2}"
+            );
+        }
+    }
 }
