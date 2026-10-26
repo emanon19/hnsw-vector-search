@@ -117,4 +117,4 @@ It does not require a web API, external database, or deployment infrastructure.
 
 ## License
 
-Add your preferred license before distributing the project publicly.
+MIT License
